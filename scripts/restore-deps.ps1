@@ -1,17 +1,11 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-function Get-Sha256([string] $Path) {
-    $stream = [IO.File]::OpenRead($Path)
-    $sha = [Security.Cryptography.SHA256]::Create()
-    try { return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
-    finally { $sha.Dispose(); $stream.Dispose() }
-}
-
-# The package and DLL hashes are pinned together. Review both when updating dnlib.
-$version = '4.5.0'
-$packageHash = '63bc2f9579568204cc8b30fa9f6700a231bcf868a8032e09118887af3eafee58'
-$dllHash = '97ef5328d1d1703924c48d9cd1d45b7227fe3836e116dcded623b6a0dbd52c23'
+. (Join-Path $PSScriptRoot 'dependencies.ps1')
+$dependency = Get-DnlibDependency
+$version = $dependency.version
+$packageHash = $dependency.packageSha256
+$dllHash = $dependency.dllSha256
 $root = Split-Path -Parent $PSScriptRoot
 $destination = Join-Path $root 'dnlib.dll'
 

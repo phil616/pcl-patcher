@@ -1,0 +1,8 @@
+{
+  "formatVersion": 1,
+  "dnlib": {
+    "version": "4.5.0",
+    "packageSha256": "63bc2f9579568204cc8b30fa9f6700a231bcf868a8032e09118887af3eafee58",
+    "dllSha256": "97ef5328d1d1703924c48d9cd1d45b7227fe3836e116dcded623b6a0dbd52c23"
+  }
+}

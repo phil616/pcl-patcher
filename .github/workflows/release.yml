@@ -15,7 +15,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  ci:
+    if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/')
     runs-on: windows-2022
     timeout-minutes: 15
     steps:
@@ -23,40 +24,88 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
       - name: Build with verified dependencies
         shell: cmd
         run: build.cmd
-
       - name: Security and IL regression tests
         shell: powershell
         run: ./scripts/test.ps1
+      - name: Release package and SBOM regression tests
+        shell: pwsh
+        run: ./scripts/test-release.ps1
 
+  release-build:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build with verified dependencies
+        shell: cmd
+        run: build.cmd
+      - name: Security and IL regression tests
+        shell: powershell
+        run: ./scripts/test.ps1
+      - name: Release package and SBOM regression tests
+        shell: pwsh
+        run: ./scripts/test-release.ps1
       - name: Package tag release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: ./scripts/package.ps1 -Tag $env:RELEASE_TAG
 
+      - name: Attest build provenance of the ZIP and SBOM
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/*.spdx.json
+
+      - name: Attest the SBOM for the ZIP
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*.zip
+          sbom-path: dist/pcl-patcher-${{ github.ref_name }}.spdx.json
+
+      - name: Include verification bundles and refresh checksums
+        shell: pwsh
+        env:
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+        run: |
+          Copy-Item -LiteralPath $env:PROVENANCE_BUNDLE -Destination dist/build-provenance.sigstore.json
+          Copy-Item -LiteralPath $env:SBOM_BUNDLE -Destination dist/sbom.sigstore.json
+          $lines = Get-ChildItem -LiteralPath dist -File |
+            Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object Name |
+            ForEach-Object { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() + '  ' + $_.Name }
+          [IO.File]::WriteAllText((Join-Path $PWD 'dist/SHA256SUMS.txt'), (($lines -join "`n") + "`n"), [Text.Encoding]::ASCII)
+
       - name: Upload release files
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-files
-          path: |
-            dist/*.zip
-            dist/SHA256SUMS.txt
+          path: dist/*
           if-no-files-found: error
           retention-days: 7
 
   release:
-    needs: build
+    needs: release-build
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
+      attestations: read
     steps:
       - name: Download tested release files
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -64,9 +113,28 @@ jobs:
           name: release-files
           path: dist
 
-      - name: Verify archive checksum
-        working-directory: dist
-        run: sha256sum --check SHA256SUMS.txt
+      - name: Verify checksums, provenance and signed SBOM
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --strict --check SHA256SUMS.txt
+          archive="pcl-patcher-$RELEASE_TAG-windows.zip"
+          sbom="pcl-patcher-$RELEASE_TAG.spdx.json"
+          policy=(--repo "$GH_REPO"
+            --signer-workflow "$GH_REPO/.github/workflows/release.yml"
+            --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA"
+            --deny-self-hosted-runners)
+          gh attestation verify "$archive" --bundle build-provenance.sigstore.json "${policy[@]}"
+          gh attestation verify "$sbom" --bundle build-provenance.sigstore.json "${policy[@]}"
+          gh attestation verify "$archive" --bundle sbom.sigstore.json "${policy[@]}" \
+            --predicate-type https://spdx.dev/Document/v2.3 \
+            --format json --jq '.[0].verificationResult.statement.predicate' > "$RUNNER_TEMP/verified-sbom.json"
+          diff -u <(jq --sort-keys . "$sbom") <(jq --sort-keys . "$RUNNER_TEMP/verified-sbom.json")
 
       - name: Publish GitHub Release
         shell: bash
@@ -86,6 +154,10 @@ jobs:
             options+=(--prerelease)
           fi
           gh release create "$RELEASE_TAG" \
-            "dist/pcl-patcher-$RELEASE_TAG-windows.zip" dist/SHA256SUMS.txt \
+            "dist/pcl-patcher-$RELEASE_TAG-windows.zip" \
+            "dist/pcl-patcher-$RELEASE_TAG.spdx.json" \
+            dist/build-provenance.sigstore.json dist/sbom.sigstore.json dist/SHA256SUMS.txt \
             --verify-tag --title "$RELEASE_TAG" --generate-notes --draft "${options[@]}"
           gh release edit "$RELEASE_TAG" --draft=false
+          gh release verify "$RELEASE_TAG"
+          gh release verify-asset "$RELEASE_TAG" "dist/pcl-patcher-$RELEASE_TAG-windows.zip"

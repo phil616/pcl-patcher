@@ -61,9 +61,53 @@ git push origin v1.0.0
 
 请先提交并推送包含工作流的代码，再创建标签。版本标签使用 `v主版本.次版本.修订版本`，例如 `v1.0.0`；`v1.1.0-rc.1` 等带后缀标签自动标记为预发布。普通分支、PR 和手动运行均不会发版。
 
-发布附件包含 `pcl-patcher-<标签>-windows.zip` 和 `SHA256SUMS.txt`。ZIP 内为 `patch.exe`、`dnlib.dll`、README、许可证、安全说明和第三方声明，不包含 PCL2 程序。可以用 `Get-FileHash <ZIP路径> -Algorithm SHA256` 与校验文件比对。
+发布附件包括：
 
-发布使用仓库自带的 `GITHUB_TOKEN`，无需配置个人访问令牌。仓库或组织策略需允许发布作业申请 `contents: write`。已有同名 Release 时工作流会失败，不覆盖现有发布；若附件上传或公开步骤失败，应先检查留下的草稿。
+| 附件 | 内容 |
+| --- | --- |
+| `pcl-patcher-<标签>-windows.zip` | 补丁工具、dnlib、说明与许可证、依赖清单和 `SBOM.spdx.json` |
+| `pcl-patcher-<标签>.spdx.json` | 与 ZIP 内相同的 SPDX 2.3 SBOM，包含组件版本、许可证声明、包标识和实际分发文件摘要 |
+| `build-provenance.sigstore.json` | ZIP 和 SBOM 的 GitHub 构建来源证明 |
+| `sbom.sigstore.json` | 将 SBOM 与 ZIP 摘要绑定的证明 |
+| `SHA256SUMS.txt` | ZIP、SBOM 和两个证明文件的 SHA256 |
+
+ZIP 不包含 PCL2 程序。生成 SBOM 时不记录 SBOM 自身的摘要，以避免循环引用；最终 ZIP 的构建证明覆盖其中的全部字节。SBOM 中的 dnlib 包摘要指向上游 NuGet 包，DLL 文件摘要指向实际分发的 `net45` DLL。
+
+发布使用仓库自带的 `GITHUB_TOKEN` 和 OIDC，无需配置个人访问令牌或长期签名密钥。普通 CI 只有读取权限；标签构建单独获得 `id-token: write`、`attestations: write`，发布作业获得 `contents: write` 和 `attestations: read`。发布前必须通过摘要校验、限定仓库/工作流/标签/提交的构建证明验证，以及签名 SBOM 与附件的一致性检查。
+
+仓库已启用不可变发布（2026-10-20 已核实）。发布时先创建草稿、上传全部附件，再公开并执行 `gh release verify`；公开后不能替换附件或移动关联标签，修复请使用新版本号。已有同名 Release 时工作流会失败；若上传或公开步骤失败，应先检查留下的草稿。
+
+### 验证下载的发布包
+
+安装较新版本的 [GitHub CLI](https://cli.github.com/)，下载同一 Release 的全部附件后，在附件目录执行：
+
+```powershell
+$tag = 'v1.0.0'
+$zip = "pcl-patcher-$tag-windows.zip"
+gh release verify $tag --repo phil616/pcl-patcher
+gh release verify-asset $tag $zip --repo phil616/pcl-patcher
+
+$policy = @('--repo', 'phil616/pcl-patcher',
+    '--signer-workflow', 'phil616/pcl-patcher/.github/workflows/release.yml',
+    '--source-ref', "refs/tags/$tag", '--deny-self-hosted-runners')
+gh attestation verify $zip @policy --bundle build-provenance.sigstore.json
+gh attestation verify "pcl-patcher-$tag.spdx.json" @policy --bundle build-provenance.sigstore.json
+gh attestation verify $zip @policy --bundle sbom.sigstore.json --predicate-type https://spdx.dev/Document/v2.3
+```
+
+每条命令都应成功退出；必要时可通过 `--source-digest <预期提交SHA>` 进一步限定源码提交。也可以用 `Get-FileHash <附件路径> -Algorithm SHA256` 与校验文件比对，但单独比对哈希不能替代来源证明验证。证明用于验证来源和完整性，不保证程序没有漏洞。详见 [GitHub 构建证明文档](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations) 和 [发布完整性验证](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/verify-release-integrity)。
+
+### 维护依赖
+
+依赖由维护者手动审阅和更新。升级 dnlib 需要同时更新 `packages.config`、`dependencies.lock.json` 中的版本及包/DLL SHA256，以及第三方许可证声明。只改版本号会导致构建失败；升级 GitHub Actions 时需要审阅并更新工作流中的完整 commit SHA。
+
+本地运行打包与 SBOM 回归检查需要 PowerShell 7：
+
+```powershell
+pwsh -NoProfile -File scripts/test-release.ps1
+```
+
+标准依赖清单提供 GitHub 依赖识别，哈希锁定记录负责构建校验；`dependencies.lock.json` 是本项目的哈希记录，不是 NuGet 原生锁文件。当前保留完整 SHA 固定 Actions，尚未采用处于公开预览阶段的 Actions lockfile。
 
 ## 免责声明
 
