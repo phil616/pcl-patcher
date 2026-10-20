@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using dnlib.DotNet;
 using dnlib.DotNet.Emit;
 
@@ -7,28 +8,50 @@ static class Patcher
 {
     static ModuleDefMD mod;
 
-    static void Main(string[] args)
+    static int Main(string[] args)
     {
+        if (args.Length == 1 && (args[0] == "--help" || args[0] == "-h"))
+        {
+            Console.WriteLine("Usage: patch.exe <original.exe> <new-output.exe>");
+            return 0;
+        }
         try
         {
             Run(args);
+            return 0;
         }
         catch (Exception e)
         {
-            Console.WriteLine("FATAL: " + e);
-            Environment.Exit(1);
+            Console.Error.WriteLine("ERROR: " + e.Message);
+            return 1;
+        }
+        finally
+        {
+            if (mod != null) mod.Dispose();
         }
     }
 
     static void Run(string[] args)
     {
-        string src = args[0];
-        string dst = args[1];
+        if (args.Length != 2)
+            throw new ArgumentException("Usage: patch.exe <original.exe> <new-output.exe>");
+        string src = Path.GetFullPath(args[0]);
+        string dst = Path.GetFullPath(args[1]);
+        if (String.Equals(src, dst, StringComparison.OrdinalIgnoreCase))
+            throw new IOException("Input and output must be different files.");
+        if (!File.Exists(src)) throw new FileNotFoundException("Input file not found.", src);
+        if (File.Exists(dst) || Directory.Exists(dst))
+            throw new IOException("Output already exists; choose a new output path.");
+        if (!Directory.Exists(Path.GetDirectoryName(dst)))
+            throw new DirectoryNotFoundException("Output directory does not exist.");
         mod = ModuleDefMD.Load(src);
 
         // 1) ModSecret.RestrictMcDownload = False
-        TypeDef modSecret = mod.Find("PCL.ModSecret", false);
+        TypeDef modSecret = RequireType("PCL.ModSecret");
         FieldDef restrict = modSecret.FindField("RestrictMcDownload");
+        if (restrict == null || !restrict.IsLiteral || restrict.FieldType.ElementType != ElementType.Boolean ||
+            restrict.Constant == null || !(restrict.Constant.Value is bool) || !(bool)restrict.Constant.Value)
+            throw new InvalidOperationException("Unsupported or already patched input: RestrictMcDownload must be a Boolean constant set to True.");
         restrict.Constant.Value = false;
         Console.WriteLine("[1] RestrictMcDownload -> " + restrict.Constant.Value);
 
@@ -37,15 +60,28 @@ static class Patcher
         PatchModpackInstall();
         PatchModpackInstallNoArg();
 
-        mod.Write(dst);
+        // Write beside the destination, then rename without replacing any existing file.
+        // Failed patching/writing must never leave a partial destination or truncate the input.
+        string temp = Path.Combine(Path.GetDirectoryName(dst), ".pcl-patch-" + Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            using (FileStream output = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                mod.Write(output);
+            File.Move(temp, dst);
+        }
+        finally
+        {
+            if (File.Exists(temp)) File.Delete(temp);
+        }
         Console.WriteLine("[OK] written: " + dst);
     }
 
     // 2) PageDownloadInstall.LoaderInit: replace the "restricted" throwing loader with the real DlClientListLoader
     static void PatchLoaderInit()
     {
-        TypeDef t = mod.Find("PCL.PageDownloadInstall", false);
-        MethodDef m = t.FindMethod("LoaderInit");
+        TypeDef t = RequireType("PCL.PageDownloadInstall");
+        MethodDef m = FindMethod(t, "LoaderInit");
+        if (!m.HasBody) throw new InvalidOperationException("LoaderInit has no IL body.");
         IList<Instruction> ins = m.Body.Instructions;
 
         int k = -1;
@@ -56,12 +92,17 @@ static class Patcher
             IMethod ctor = ins[i + 12].Operand as IMethod;
             if (ctor == null || ctor.DeclaringType == null) continue;
             if (!ctor.DeclaringType.Name.String.Contains("LoaderTask")) continue;
+            if (k >= 0) throw new InvalidOperationException("Ambiguous LoaderInit pattern.");
             k = i;
-            break;
         }
         if (k < 0) throw new Exception("LoaderInit pattern not found");
 
-        FieldDef dl = mod.Find("PCL.ModDownload", false).FindField("DlClientListLoader");
+        FieldDef dl = RequireType("PCL.ModDownload").FindField("DlClientListLoader");
+        IMethod loaderCtor = (IMethod)ins[k + 12].Operand;
+        if (dl == null || !dl.IsStatic ||
+            !new SigComparer().Equals(dl.FieldType, loaderCtor.DeclaringType.ToTypeSig()))
+            throw new InvalidOperationException("DlClientListLoader type does not match the loader constructor.");
+        RejectEntryIntoRange(m.Body, k + 1, 12);
         ins[k].OpCode = OpCodes.Ldsfld;
         ins[k].Operand = dl;
         for (int j = 1; j <= 12; j++)
@@ -75,7 +116,7 @@ static class Patcher
     // 3) PageDownloadModify.LoadInstanceFinished: CardMinecraft.Visibility = Visible
     static void PatchVisibility()
     {
-        TypeDef t = mod.Find("PCL.PageDownloadModify", false);
+        TypeDef t = RequireType("PCL.PageDownloadModify");
         int n = 0;
         foreach (MethodDef m in t.Methods)
         {
@@ -84,10 +125,15 @@ static class Patcher
             for (int i = 0; i + 2 < ins.Count; i++)
             {
                 IMethod get = ins[i].Operand as IMethod;
-                if (get == null || get.Name.String != "get_CardMinecraft") continue;
+                if (get == null || get.Name.String != "get_CardMinecraft" ||
+                    get.DeclaringType.FullName != t.FullName || get.MethodSig.Params.Count != 0 ||
+                    (ins[i].OpCode.Code != Code.Call && ins[i].OpCode.Code != Code.Callvirt)) continue;
                 if (ins[i + 1].OpCode.Code != Code.Ldc_I4_2) continue;
                 IMethod set = ins[i + 2].Operand as IMethod;
-                if (set == null || set.Name.String != "set_Visibility") continue;
+                if (set == null || set.Name.String != "set_Visibility" || set.MethodSig.Params.Count != 1 ||
+                    set.MethodSig.Params[0].FullName != "System.Windows.Visibility" ||
+                    (ins[i + 2].OpCode.Code != Code.Call && ins[i + 2].OpCode.Code != Code.Callvirt)) continue;
+                RejectEntryIntoRange(m.Body, i + 1, 2);
                 ins[i + 1].OpCode = OpCodes.Ldc_I4_0;
                 ins[i + 1].Operand = null;
                 n++;
@@ -100,19 +146,18 @@ static class Patcher
     // 4) ModpackInstall(File, InstanceName, Logo): restore the pack-type dispatch that was removed by const folding
     static void PatchModpackInstall()
     {
-        TypeDef t = mod.Find("PCL.ModModpack", false);
-        MethodDef target = null;
-        foreach (MethodDef m in t.Methods)
-        {
-            if (m.Name.String == "ModpackInstall" && m.HasBody && m.Body.Instructions.Count > 100)
-            {
-                target = m;
-                break;
-            }
-        }
-        if (target == null) throw new Exception("ModpackInstall(3 args) not found");
+        TypeDef t = RequireType("PCL.ModModpack");
+        MethodDef target = FindMethod(t, "ModpackInstall", 3);
+        RequireInstallSignature(target, false);
+        if (!target.HasBody || target.Body.Variables.Count < 5)
+            throw new InvalidOperationException("Unsupported ModpackInstall body.");
+        if (target.Body.Variables[0].Type.ElementType != ElementType.Boolean ||
+            target.Body.Variables[2].Type.ElementType != ElementType.String ||
+            target.Body.Variables[4].Type.ElementType != ElementType.I4)
+            throw new InvalidOperationException("Unsupported ModpackInstall local variable layout.");
 
         CilBody body = target.Body;
+        body.SimplifyBranches();
         IList<Instruction> ins = body.Instructions;
 
         int ti = -1;
@@ -124,14 +169,13 @@ static class Patcher
             if (ins[i - 2].OpCode.Code != Code.Ldstr) continue;
             string s = ins[i - 2].Operand as string;
             if (s == null || !s.Contains("qwq")) continue;
+            if (ti >= 0) throw new InvalidOperationException("Ambiguous restriction throw pattern.");
             ti = i;
-            break;
         }
         if (ti < 0) throw new Exception("restriction throw not found");
 
         Instruction ldstrIns = ins[ti - 2];
-        Instruction newobjIns = ins[ti - 1];
-        Instruction throwIns = ins[ti];
+        RejectEntryIntoRange(body, ti - 1, 2);
 
         Local v0 = body.Variables[0];
         Local v1 = body.Variables[1];
@@ -173,11 +217,15 @@ static class Patcher
             if (eh.HandlerType == ExceptionHandlerType.Finally && eh.HandlerEnd == null)
                 eh.HandlerEnd = endMarker;
         }
+        body.OptimizeBranches();
         Console.WriteLine("[4] ModpackInstall dispatch restored (finally HandlerEnd fixed)");
     }
 
     static MethodDef CreateDispatch(TypeDef t, MethodDef orig)
     {
+        foreach (MethodDef existing in t.Methods)
+            if (existing.Name == "ModpackInstallDispatch")
+                throw new InvalidOperationException("ModpackInstallDispatch already exists.");
         TypeSig zip = orig.Body.Variables[1].Type;
         MethodSig sig = MethodSig.CreateStatic(orig.ReturnType, new TypeSig[] {
             mod.CorLibTypes.Int32, mod.CorLibTypes.String, zip,
@@ -231,6 +279,13 @@ static class Patcher
 
     static void AddCase(CilBody b, MethodDef md, Instruction label, MethodDef target, int[] args)
     {
+        SigComparer comparer = new SigComparer();
+        if (!target.IsStatic || target.MethodSig.Params.Count != args.Length ||
+            !comparer.Equals(target.ReturnType, md.ReturnType))
+            throw new InvalidOperationException("Unsupported install signature: " + target.FullName);
+        for (int i = 0; i < args.Length; i++)
+            if (!comparer.Equals(target.MethodSig.Params[i], md.Parameters[args[i]].Type))
+                throw new InvalidOperationException("Unsupported install parameter: " + target.FullName);
         b.Instructions.Add(label);
         for (int i = 0; i < args.Length; i++)
             b.Instructions.Add(Instruction.Create(OpCodes.Ldarg, md.Parameters[args[i]]));
@@ -241,31 +296,29 @@ static class Patcher
     // 5) ModpackInstall(): restore file picker + install call
     static void PatchModpackInstallNoArg()
     {
-        TypeDef t = mod.Find("PCL.ModModpack", false);
-        MethodDef m0 = null;
-        MethodDef m3 = null;
-        foreach (MethodDef m in t.Methods)
-        {
-            if (m.Name.String != "ModpackInstall") continue;
-            if (m.MethodSig.Params.Count == 0) m0 = m;
-            else if (m.MethodSig.Params.Count == 3) m3 = m;
-        }
-        if (m0 == null || m3 == null) throw new Exception("ModpackInstall overloads not found");
+        TypeDef t = RequireType("PCL.ModModpack");
+        MethodDef m0 = FindMethod(t, "ModpackInstall", 0);
+        MethodDef m3 = FindMethod(t, "ModpackInstall", 3);
+        RequireInstallSignature(m0, true);
+        RequireInstallSignature(m3, false);
+        if (!m0.HasBody) throw new InvalidOperationException("ModpackInstall() has no IL body.");
 
-        MethodDef jm = mod.Find("PCL.ModJava", false).FindMethod("ManuallyImportJava");
+        MethodDef jm = FindMethod(RequireType("PCL.ModJava"), "ManuallyImportJava");
+        if (!jm.HasBody) throw new InvalidOperationException("ManuallyImportJava has no IL body.");
         IList<Instruction> jins = jm.Body.Instructions;
         IMethod selectFile = null, oneOf = null, nullableCtor = null, firstOrDefault = null;
         for (int i = 3; i + 2 < jins.Count; i++)
         {
             IMethod im = jins[i].Operand as IMethod;
             if (im == null || im.Name.String != "SelectFile") continue;
+            if (selectFile != null) throw new InvalidOperationException("Ambiguous SelectFile references.");
             selectFile = im;
             oneOf = jins[i - 2].Operand as IMethod;
             nullableCtor = jins[i - 1].Operand as IMethod;
             firstOrDefault = jins[i + 1].Operand as IMethod;
-            break;
         }
-        if (selectFile == null || oneOf == null || nullableCtor == null || firstOrDefault == null)
+        if (selectFile == null || oneOf == null || nullableCtor == null || firstOrDefault == null ||
+            nullableCtor.Name != ".ctor" || firstOrDefault.Name != "FirstOrDefault")
             throw new Exception("SelectFile refs not found");
 
         IMethod isNullOrEmpty = FindCall("IsNullOrEmpty");
@@ -301,11 +354,54 @@ static class Patcher
         Console.WriteLine("[5] ModpackInstall() file picker restored");
     }
 
-    static MethodDef FindMethod(TypeDef t, string name)
+    static TypeDef RequireType(string name)
     {
+        TypeDef t = mod.Find(name, false);
+        if (t == null) throw new InvalidOperationException("Unsupported input; type not found: " + name);
+        return t;
+    }
+
+    static void RequireInstallSignature(MethodDef method, bool noArgs)
+    {
+        if (!method.IsStatic || method.ReturnType.ElementType != (noArgs ? ElementType.Void : ElementType.Boolean))
+            throw new InvalidOperationException("Unsupported signature: " + method.FullName);
+        foreach (TypeSig parameter in method.MethodSig.Params)
+            if (parameter.ElementType != ElementType.String)
+                throw new InvalidOperationException("Unsupported parameter: " + method.FullName);
+    }
+
+    // Branches and exception boundaries must not enter instructions being removed/replaced.
+    static void RejectEntryIntoRange(CilBody body, int start, int count)
+    {
+        HashSet<Instruction> range = new HashSet<Instruction>();
+        for (int i = start; i < start + count; i++) range.Add(body.Instructions[i]);
+        foreach (Instruction instruction in body.Instructions)
+        {
+            Instruction branch = instruction.Operand as Instruction;
+            IList<Instruction> targets = instruction.Operand as IList<Instruction>;
+            if (branch != null && range.Contains(branch))
+                throw new InvalidOperationException("Unsupported branch into patch region.");
+            if (targets != null)
+                foreach (Instruction target in targets)
+                    if (range.Contains(target)) throw new InvalidOperationException("Unsupported switch into patch region.");
+        }
+        foreach (ExceptionHandler handler in body.ExceptionHandlers)
+            if (range.Contains(handler.TryStart) || range.Contains(handler.TryEnd) ||
+                range.Contains(handler.HandlerStart) || range.Contains(handler.HandlerEnd) || range.Contains(handler.FilterStart))
+                throw new InvalidOperationException("Unsupported exception boundary in patch region.");
+    }
+
+    static MethodDef FindMethod(TypeDef t, string name, int parameterCount = -1)
+    {
+        MethodDef result = null;
         foreach (MethodDef m in t.Methods)
-            if (m.Name.String == name) return m;
-        throw new Exception("method not found: " + name);
+        {
+            if (m.Name.String != name || (parameterCount >= 0 && m.MethodSig.Params.Count != parameterCount)) continue;
+            if (result != null) throw new InvalidOperationException("Ambiguous method: " + t.FullName + "." + name);
+            result = m;
+        }
+        if (result == null) throw new InvalidOperationException("Method not found: " + t.FullName + "." + name);
+        return result;
     }
 
     static IMethod FindCall(string name)
@@ -318,7 +414,10 @@ static class Patcher
                 foreach (Instruction ins in m.Body.Instructions)
                 {
                     IMethod im = ins.Operand as IMethod;
-                    if (im != null && im.Name.String == name) return im;
+                    if (ins.OpCode.Code == Code.Call && im != null && im.Name.String == name &&
+                        im.DeclaringType.FullName == "System.String" && !im.MethodSig.HasThis &&
+                        im.MethodSig.Params.Count == 1 && im.MethodSig.Params[0].ElementType == ElementType.String &&
+                        im.MethodSig.RetType.ElementType == ElementType.Boolean) return im;
                 }
             }
         }

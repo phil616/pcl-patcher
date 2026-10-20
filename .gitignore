@@ -3,3 +3,4 @@ obj/
 *.exe
 *.bak
 dnlib.dll
+dist/
