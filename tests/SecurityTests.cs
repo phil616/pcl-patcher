@@ -15,6 +15,7 @@ static class SecurityTests
 {
     static string patcher;
     static string work;
+    static string lastOutput;
     static int checks;
 
     static int Main(string[] args)
@@ -40,13 +41,26 @@ static class SecurityTests
             Check(Run(Q(input) + " " + Q(work)) != 0, "directory output rejected");
             Check(Run(Q(input) + " " + Q(Path.Combine(work, "missing", "out.dll"))) != 0, "missing parent rejected");
 
-            foreach (string mode in new[] { "already-patched", "ambiguous-loader", "branch-into-loader", "wrong-installer-signature", "wrong-locals" })
+            foreach (string mode in new[] { "already-patched", "ambiguous-loader", "branch-into-loader", "switch-into-loader", "wrong-installer-signature", "wrong-installer-return", "wrong-result-local", "wrong-locals" })
             {
                 Fixture(input, mode);
                 string hash = Hash(input);
                 Check(Run(Q(input) + " " + Q(output)) != 0 && !File.Exists(output) && Hash(input) == hash, mode);
                 Check(Directory.GetFiles(work, ".pcl-patch-*.tmp").Length == 0, mode + " leaves no temporary output");
             }
+
+            Fixture(input, "internal-loader-branches");
+            originalHash = Hash(input);
+            Check(Run(Q(input) + " " + Q(output)) == 0 && Hash(input) == originalHash, "VB delegate-cache internal branches are replaced safely");
+            using (ModuleDefMD result = ModuleDefMD.Load(output))
+            {
+                MethodDef loader = result.Find("PCL.PageDownloadInstall", false).FindMethod("LoaderInit");
+                Check(loader.Body.Instructions.Count(i => i.OpCode.Code == Code.Ldsfld) == 1 &&
+                    !loader.Body.Instructions.Any(i => i.Operand is Instruction), "internal branches disappear with replaced loader instructions");
+            }
+            Assembly.Load(File.ReadAllBytes(output)).GetType("PCL.PageDownloadInstall").GetMethod("LoaderInit").Invoke(null, null);
+            checks++;
+            File.Delete(output);
 
             Fixture(input, "valid");
             originalHash = Hash(input);
@@ -59,15 +73,21 @@ static class SecurityTests
                 Check(install.Body.ExceptionHandlers.Count == 1, "patched method retains its finally handler (actual: " + install.Body.ExceptionHandlers.Count + ")");
                 ExceptionHandler handler = install.Body.ExceptionHandlers.Single();
                 Check(handler.HandlerEnd != null && handler.HandlerEnd.OpCode.Code == Code.Nop, "finally boundary closed before return");
-                Check(result.Find("PCL.PageDownloadModify", false).FindMethod("LoadInstanceFinished").Body.Instructions[1].OpCode.Code == Code.Ldc_I4_0, "visibility patched");
+                Check(result.Find("PCL.PageDownloadModify", false).FindMethod("LoadInstanceFinished").Body.Instructions[1].OpCode.Code == Code.Ldc_I4_0, "inherited CardMinecraft visibility patched");
             }
             // Only our own generated assembly is executed. The CLR checks the rewritten IL.
             Assembly fixture = Assembly.Load(File.ReadAllBytes(output));
             Type modpack = fixture.GetType("PCL.ModModpack");
             MethodInfo dispatch = modpack.GetMethod("ModpackInstallDispatch", BindingFlags.NonPublic | BindingFlags.Static);
-            foreach (int packType in new[] { 0, 1, 2, 3, 4, 9, -1, 99 })
-                Check((bool)dispatch.Invoke(null, new object[] { packType, null, null, null, null, null }), "dispatch type " + packType);
-            Check((bool)modpack.GetMethod("ModpackInstall", new[] { typeof(string), typeof(string), typeof(string) }).Invoke(null, new object[] { null, null, null }), "patched try/finally executes");
+            int[] packTypes = { 0, 1, 2, 3, 4, 9, -1, 99 };
+            string[] expected = { "InstallPackCurseForge", "InstallPackHMCL", "InstallPackMMC", "InstallPackMCBBS", "InstallPackModrinth", "InstallPackLauncherPack", "InstallPackCompress", "InstallPackCompress" };
+            for (int i = 0; i < packTypes.Length; i++)
+            {
+                object value = dispatch.Invoke(null, new object[] { packTypes[i], null, null, null, null, null });
+                Check(value != null && (string)value.GetType().GetField("Kind").GetValue(value) == expected[i], "reference-returning dispatch type " + packTypes[i]);
+            }
+            object installed = modpack.GetMethod("ModpackInstall", new[] { typeof(string), typeof(string), typeof(string) }).Invoke(null, new object[] { null, null, null });
+            Check(installed != null && (string)installed.GetType().GetField("Kind").GetValue(installed) == "InstallPackCurseForge", "patched try/finally returns LoaderCombo<String>");
             modpack.GetMethod("ModpackInstall", Type.EmptyTypes).Invoke(null, null);
             checks++;
             fixture.GetType("PCL.PageDownloadInstall").GetMethod("LoaderInit").Invoke(null, null);
@@ -95,7 +115,7 @@ static class SecurityTests
     }
     static void Check(bool condition, string name)
     {
-        if (!condition) throw new Exception("FAILED: " + name);
+        if (!condition) throw new Exception("FAILED: " + name + Environment.NewLine + lastOutput);
         checks++;
     }
     static int Run(string arguments)
@@ -103,9 +123,14 @@ static class SecurityTests
         ProcessStartInfo info = new ProcessStartInfo(patcher, arguments);
         info.UseShellExecute = false;
         info.CreateNoWindow = true;
+        info.RedirectStandardOutput = true;
+        info.RedirectStandardError = true;
         using (Process process = Process.Start(info))
         {
+            var stdout = process.StandardOutput.ReadToEndAsync();
+            var stderr = process.StandardError.ReadToEndAsync();
             if (!process.WaitForExit(30000)) { process.Kill(); throw new Exception("Patcher timed out."); }
+            lastOutput = stdout.Result + stderr.Result;
             return process.ExitCode;
         }
     }
@@ -149,14 +174,30 @@ static class SecurityTests
             secret.Fields.Add(new FieldDefUser("RestrictMcDownload", new FieldSig(boolean), FA.Public | FA.Static | FA.Literal | FA.HasDefault) { Constant = new ConstantUser(mode != "already-patched") });
 
             TypeDef loader = AddType(module, "LoaderTask");
-            MethodDef ctor = Constructor(loader, Enumerable.Repeat(str, 12).ToArray());
+            bool internalBranches = mode == "internal-loader-branches";
+            MethodDef ctor = Constructor(loader, internalBranches ? new[] { str, obj, obj, integer } : Enumerable.Repeat(str, 12).ToArray());
             FieldDef dl = new FieldDefUser("DlClientListLoader", new FieldSig(loader.ToTypeSig()), FA.Public | FA.Static);
             AddType(module, "ModDownload").Fields.Add(dl);
-            MethodDef init = Method(AddType(module, "PageDownloadInstall"), "LoaderInit", none);
+            TypeDef installPage = AddType(module, "PageDownloadInstall");
+            MethodDef init = Method(installPage, "LoaderInit", none);
             for (int block = 0; block < (mode == "ambiguous-loader" ? 2 : 1); block++)
             {
                 Emit(init, Instruction.Create(OpCodes.Ldstr, "restricted"));
-                for (int i = 0; i < 11; i++) Emit(init, Instruction.Create(OpCodes.Ldnull));
+                if (internalBranches)
+                {
+                    FieldDef cache = new FieldDefUser("CachedDelegate", new FieldSig(module.ImportAsTypeSig(typeof(Action))), FA.Public | FA.Static);
+                    installPage.Fields.Add(cache);
+                    MethodDef callback = Method(installPage, "RestrictedCallback", none);
+                    Emit(callback, Instruction.Create(OpCodes.Ret));
+                    Instruction create = Instruction.Create(OpCodes.Ldnull);
+                    Instruction done = Instruction.Create(OpCodes.Ldnull);
+                    Emit(init, Instruction.Create(OpCodes.Ldsfld, cache), Instruction.Create(OpCodes.Brfalse_S, create),
+                        Instruction.Create(OpCodes.Ldsfld, cache), Instruction.Create(OpCodes.Br_S, done), create,
+                        Instruction.Create(OpCodes.Ldftn, callback),
+                        Instruction.Create(OpCodes.Newobj, module.Import(typeof(Action).GetConstructor(new[] { typeof(object), typeof(IntPtr) }))),
+                        Instruction.Create(OpCodes.Dup), Instruction.Create(OpCodes.Stsfld, cache), done, Instruction.Create(OpCodes.Ldc_I4_2));
+                }
+                else for (int i = 0; i < 11; i++) Emit(init, Instruction.Create(OpCodes.Ldnull));
                 Emit(init, Instruction.Create(OpCodes.Newobj, ctor), Instruction.Create(OpCodes.Pop));
             }
             Emit(init, Instruction.Create(OpCodes.Ret));
@@ -164,6 +205,14 @@ static class SecurityTests
             {
                 Instruction target = init.Body.Instructions[1];
                 init.Body.Instructions.Insert(0, Instruction.Create(OpCodes.Br, target));
+                init.Body.Instructions.Insert(0, Instruction.Create(OpCodes.Ldstr, "alternate entry"));
+            }
+            if (mode == "switch-into-loader")
+            {
+                Instruction target = init.Body.Instructions[1];
+                init.Body.Instructions.Insert(0, Instruction.Create(OpCodes.Pop));
+                init.Body.Instructions.Insert(0, Instruction.Create(OpCodes.Switch, new[] { target }));
+                init.Body.Instructions.Insert(0, Instruction.Create(OpCodes.Ldc_I4_0));
                 init.Body.Instructions.Insert(0, Instruction.Create(OpCodes.Ldstr, "alternate entry"));
             }
 
@@ -177,15 +226,27 @@ static class SecurityTests
             card.Methods.Add(setter);
             Emit(setter, Instruction.Create(OpCodes.Ret));
             TypeDef modify = AddType(module, "PageDownloadModify");
-            MethodDef getter = Method(modify, "get_CardMinecraft", card.ToTypeSig());
+            modify.BaseType = installPage;
+            MethodDef getter = Method(installPage, "get_CardMinecraft", card.ToTypeSig());
             Emit(getter, Instruction.Create(OpCodes.Ldnull), Instruction.Create(OpCodes.Ret));
             MethodDef finished = Method(modify, "LoadInstanceFinished", none);
             Emit(finished, Instruction.Create(OpCodes.Call, getter), Instruction.Create(OpCodes.Ldc_I4_2), Instruction.Create(OpCodes.Callvirt, setter), Instruction.Create(OpCodes.Ret));
 
             TypeDef pack = AddType(module, "ModModpack");
-            MethodDef install = Method(pack, "ModpackInstall", boolean, str, str, str);
+            TypeDef resultType = new TypeDefUser("", "LoaderCombo`1", module.CorLibTypes.Object.TypeDefOrRef);
+            resultType.Attributes = TA.NestedPublic | TA.Class;
+            AddType(module, "ModLoader").NestedTypes.Add(resultType);
+            resultType.GenericParameters.Add(new GenericParamUser(0, GenericParamAttributes.NonVariant, "T"));
+            FieldDef kind = new FieldDefUser("Kind", new FieldSig(str), FA.Public);
+            resultType.Fields.Add(kind);
+            MethodDef resultCtor = Constructor(resultType, str);
+            resultCtor.Body.Instructions.RemoveAt(resultCtor.Body.Instructions.Count - 1);
+            Emit(resultCtor, Instruction.Create(OpCodes.Ldarg_0), Instruction.Create(OpCodes.Ldarg_1), Instruction.Create(OpCodes.Stfld, kind), Instruction.Create(OpCodes.Ret));
+            TypeSig resultSig = new GenericInstSig(new ClassSig(resultType), str);
+            IMethod newResult = new MemberRefUser(module, ".ctor", MethodSig.CreateInstance(none, str), new TypeSpecUser(resultSig));
+            MethodDef install = Method(pack, "ModpackInstall", resultSig, str, str, str);
             install.Body.InitLocals = true;
-            foreach (TypeSig local in new[] { boolean, obj, str, obj, mode == "wrong-locals" ? str : integer }) install.Body.Variables.Add(new Local(local));
+            foreach (TypeSig local in new[] { mode == "wrong-result-local" ? boolean : resultSig, obj, str, obj, mode == "wrong-locals" ? str : integer }) install.Body.Variables.Add(new Local(local));
             Instruction begin = Instruction.Create(OpCodes.Ldstr, "disabled qwq");
             Instruction end = Instruction.Create(OpCodes.Nop);
             Emit(install, begin, Instruction.Create(OpCodes.Newobj, module.Import(typeof(Exception).GetConstructor(new[] { typeof(string) }))), Instruction.Create(OpCodes.Throw), end, Instruction.Create(OpCodes.Endfinally));
@@ -197,9 +258,11 @@ static class SecurityTests
             TypeSig[] installParams = { str, obj, str, str, str };
             for (int i = 0; i < installers.Length; i++)
             {
-                MethodDef target = Method(pack, installers[i], boolean, installParams.Take(counts[i]).ToArray());
+                bool wrongReturn = mode == "wrong-installer-return" && i == 0;
+                MethodDef target = Method(pack, installers[i], wrongReturn ? boolean : resultSig, installParams.Take(counts[i]).ToArray());
                 if (mode == "wrong-installer-signature" && i == 0) target.MethodSig.Params[0] = integer;
-                Emit(target, Instruction.Create(OpCodes.Ldc_I4_1), Instruction.Create(OpCodes.Ret));
+                if (wrongReturn) Emit(target, Instruction.Create(OpCodes.Ldc_I4_1), Instruction.Create(OpCodes.Ret));
+                else Emit(target, Instruction.Create(OpCodes.Ldstr, installers[i]), Instruction.Create(OpCodes.Newobj, newResult), Instruction.Create(OpCodes.Ret));
             }
 
             TypeDef java = AddType(module, "ModJava");

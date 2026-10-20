@@ -102,7 +102,7 @@ static class Patcher
         if (dl == null || !dl.IsStatic ||
             !new SigComparer().Equals(dl.FieldType, loaderCtor.DeclaringType.ToTypeSig()))
             throw new InvalidOperationException("DlClientListLoader type does not match the loader constructor.");
-        RejectEntryIntoRange(m.Body, k + 1, 12);
+        RejectEntryIntoRange(m, k + 1, 12);
         ins[k].OpCode = OpCodes.Ldsfld;
         ins[k].Operand = dl;
         for (int j = 1; j <= 12; j++)
@@ -126,14 +126,14 @@ static class Patcher
             {
                 IMethod get = ins[i].Operand as IMethod;
                 if (get == null || get.Name.String != "get_CardMinecraft" ||
-                    get.DeclaringType.FullName != t.FullName || get.MethodSig.Params.Count != 0 ||
+                    !IsTypeOrBase(t, get.DeclaringType) || get.MethodSig.Params.Count != 0 ||
                     (ins[i].OpCode.Code != Code.Call && ins[i].OpCode.Code != Code.Callvirt)) continue;
                 if (ins[i + 1].OpCode.Code != Code.Ldc_I4_2) continue;
                 IMethod set = ins[i + 2].Operand as IMethod;
                 if (set == null || set.Name.String != "set_Visibility" || set.MethodSig.Params.Count != 1 ||
                     set.MethodSig.Params[0].FullName != "System.Windows.Visibility" ||
                     (ins[i + 2].OpCode.Code != Code.Call && ins[i + 2].OpCode.Code != Code.Callvirt)) continue;
-                RejectEntryIntoRange(m.Body, i + 1, 2);
+                RejectEntryIntoRange(m, i + 1, 2);
                 ins[i + 1].OpCode = OpCodes.Ldc_I4_0;
                 ins[i + 1].Operand = null;
                 n++;
@@ -151,7 +151,7 @@ static class Patcher
         RequireInstallSignature(target, false);
         if (!target.HasBody || target.Body.Variables.Count < 5)
             throw new InvalidOperationException("Unsupported ModpackInstall body.");
-        if (target.Body.Variables[0].Type.ElementType != ElementType.Boolean ||
+        if (!new SigComparer().Equals(target.Body.Variables[0].Type, target.ReturnType) ||
             target.Body.Variables[2].Type.ElementType != ElementType.String ||
             target.Body.Variables[4].Type.ElementType != ElementType.I4)
             throw new InvalidOperationException("Unsupported ModpackInstall local variable layout.");
@@ -175,7 +175,7 @@ static class Patcher
         if (ti < 0) throw new Exception("restriction throw not found");
 
         Instruction ldstrIns = ins[ti - 2];
-        RejectEntryIntoRange(body, ti - 1, 2);
+        RejectEntryIntoRange(target, ti - 1, 2);
 
         Local v0 = body.Variables[0];
         Local v1 = body.Variables[1];
@@ -363,32 +363,47 @@ static class Patcher
 
     static void RequireInstallSignature(MethodDef method, bool noArgs)
     {
-        if (!method.IsStatic || method.ReturnType.ElementType != (noArgs ? ElementType.Void : ElementType.Boolean))
+        if (!method.IsStatic || (method.ReturnType.ElementType == ElementType.Void) != noArgs)
             throw new InvalidOperationException("Unsupported signature: " + method.FullName);
         foreach (TypeSig parameter in method.MethodSig.Params)
             if (parameter.ElementType != ElementType.String)
                 throw new InvalidOperationException("Unsupported parameter: " + method.FullName);
     }
 
-    // Branches and exception boundaries must not enter instructions being removed/replaced.
-    static void RejectEntryIntoRange(CilBody body, int start, int count)
+    static bool IsTypeOrBase(TypeDef type, ITypeDefOrRef declaringType)
     {
+        HashSet<TypeDef> visited = new HashSet<TypeDef>();
+        while (type != null && visited.Add(type))
+        {
+            if (type.FullName == declaringType.FullName) return true;
+            type = type.BaseType == null ? null : mod.Find(type.BaseType.FullName, false);
+        }
+        return false;
+    }
+
+    // Reject surviving branches into the interior of a replacement. Branches wholly
+    // inside it disappear too (e.g. VB's cached-delegate construction in LoaderInit).
+    static void RejectEntryIntoRange(MethodDef method, int start, int count)
+    {
+        CilBody body = method.Body;
         HashSet<Instruction> range = new HashSet<Instruction>();
         for (int i = start; i < start + count; i++) range.Add(body.Instructions[i]);
         foreach (Instruction instruction in body.Instructions)
         {
+            if (range.Contains(instruction)) continue;
             Instruction branch = instruction.Operand as Instruction;
             IList<Instruction> targets = instruction.Operand as IList<Instruction>;
             if (branch != null && range.Contains(branch))
-                throw new InvalidOperationException("Unsupported branch into patch region.");
+                throw new InvalidOperationException("Unsupported external branch into patch region in " + method.FullName +
+                    " (IL_" + instruction.Offset.ToString("X4") + " -> IL_" + branch.Offset.ToString("X4") + ").");
             if (targets != null)
                 foreach (Instruction target in targets)
-                    if (range.Contains(target)) throw new InvalidOperationException("Unsupported switch into patch region.");
+                    if (range.Contains(target)) throw new InvalidOperationException("Unsupported external switch into patch region in " + method.FullName + ".");
         }
         foreach (ExceptionHandler handler in body.ExceptionHandlers)
             if (range.Contains(handler.TryStart) || range.Contains(handler.TryEnd) ||
                 range.Contains(handler.HandlerStart) || range.Contains(handler.HandlerEnd) || range.Contains(handler.FilterStart))
-                throw new InvalidOperationException("Unsupported exception boundary in patch region.");
+                throw new InvalidOperationException("Unsupported exception boundary in patch region in " + method.FullName + ".");
     }
 
     static MethodDef FindMethod(TypeDef t, string name, int parameterCount = -1)
